@@ -1,0 +1,276 @@
+---
+title: "Churn Prediction Model for Telecom Companies"
+author: "Group_8"
+date: "2022-12-14"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(caret)
+library(ROCR)
+library(ggplot2)
+library(pROC)
+library(rpart)
+library(cutpointr)
+library(ROSE)
+library(writexl)
+```
+
+```{r}
+setwd("~/Desktop/R/64036-002/Group_proj")  #set working directory
+Customer <- read.csv("Churn_Train.csv")  #load the data
+load("Customers_To_Predict.RData")
+summary(Customer) 
+```
+**Data Exploration**
+```{r}
+xtabs(~churn+state, data = Customer) #churn distribution by state
+```
+
+**Comment**<br>  
+Early observations for churn customers: <br>  
+1) There is 19% of churn rate in the training data <br>  
+2) AR, KS, MA, MD, ME, MI, MN, MS, MT, NC, NJ, NV, NY, OH, OR, SC, TX, WA have higher churn rate. <br>  
+
+**Data Preparation**<br>  
+
+```{r}
+#Clean and transform the data 
+Customer <- Customer[, -c(1:3)] #delete state, account length and area code
+
+#Change negative data in account_length and number_vmail_message to positive
+Customer <- Customer%>%
+  #mutate(account_length = ifelse(account_length <0, abs(account_length), account_length))%>%
+  mutate(number_vmail_messages = ifelse(number_vmail_messages <0, abs(number_vmail_messages), number_vmail_messages))
+
+#Change binary columns to 0 and 1
+Customer$international_plan <- ifelse(Customer$international_plan=="yes", 1, 0)
+Customer$voice_mail_plan <- ifelse(Customer$voice_mail_plan=="yes", 1, 0)
+
+#Change data attribute from character to factor, the data is coded as 1 as no and 2 as yes
+Customer$churn <- as.factor(Customer$churn) 
+
+#impute missing values with mean
+Customer[, c(3:10, 11:16)] <- Customer[, c(3:10, 11:16)]%>%
+    mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = T), x))
+```
+
+**Data partition**
+```{r}
+#Partition the given training data into 70% training data and 30% testing data
+set.seed(111)
+index_train <- createDataPartition(Customer$churn, p=0.7, list= F)
+Cust_train <- Customer[index_train, ]
+Cust_test <- Customer[-index_train, ]
+```
+<br>  
+
+**Run logistic regression model**
+```{r}
+set.seed(1)
+log_model <- glm(churn~., data = Cust_train, family = 'binomial')
+```
+<br>  
+
+**Run knn model**
+```{r}
+set.seed(2)
+knn_model <- train(data = Cust_train, churn~., method = "knn", metric = "Accuracy", 
+      trControl= trainControl(), tuneGrid = NULL, tuneLength = 3)
+```
+<br>  
+
+**Run NB model**
+```{r}
+library(e1071)
+set.seed(3)
+nb_model <- naiveBayes(churn~., data = Cust_train)
+Predict_test_labels_nb <- predict(nb_model, Cust_test, type = "raw")
+```
+<br>  
+
+**Run Decision Tree**
+```{r}
+set.seed(4)
+library(rpart)
+library(rpart.plot)
+#agnes or hclust object does not work with later prediction
+dt_model <- rpart(churn~., data = Cust_test,method = "class") #class for binary
+rpart.plot(dt_model, extra = 110, main = "Dendrogram of rpart") 
+```
+
+**Model Testing**
+```{r}
+#Test the logistic regression model and return in probability
+log_test_prob <- predict(log_model, Cust_test, type = "response")
+#log_test <- cbind(Cust_test, log_test_prob)
+
+#Test the knn model
+knn_test_prob <- predict(knn_model, Cust_test, type = "prob")
+
+#Test the nb model
+nb_test_prob <- predict(nb_model, Cust_test, type = "raw")
+
+#Test the dt model- (predict does not apply to "hclust" or "agnes" object)
+dt_test_prob <- predict(dt_model, Cust_test, type = "prob")
+```
+<br>  
+<br>  
+
+**Model Comparison: Thresholding, best cutoff point, confusion table and ROC**
+```{r}
+#logistic regression 
+pred_log_test <- prediction(log_test_prob, Cust_test$churn)#create prediction obj
+
+#TPR FPR plot
+roc_perf_log_test <- performance(pred_log_test, measure = "tpr", x.measure = "fpr")
+plot(roc_perf_log_test,colorize=TRUE,print.cutoffs.at=seq(0.1,by=0.1)) 
+#TPR/FPR cutoff graph<br>  
+
+#cut-off trade-off between FPR and TPR, we want to reduce False Negative
+cost_perf = performance(pred_log_test, "cost") 
+pred_log_test@cutoffs[[1]][which.min(cost_perf@y.values[[1]])]#best cutoff 0.539
+```
+
+```{r}
+#Logistic regression AUC value
+auc.perf = performance(pred_log_test, measure = "auc")
+auc.perf@y.values
+```
+
+```{r}
+#Confusion table
+confusionMatrix(as.factor(ifelse(log_test_prob>0.5064, "yes", "no")), Cust_test$churn, positive = "yes")
+```
+<br>  
+**Logistic Regression Metric**<br>  
+True Positive (TP) = 26 <br>  
+True Negative (TN) = 835 <br>  
+False Positive (FP) = 20 <br>  
+False Negative (FN) = 118 <br>  
+Miscalculations = 138 <br>  
+Accuracy = 86.19% <br>  
+Sensitivity = 18.06% <br>  
+Specificity = 97.66% <br>  
+
+
+```{r}
+#KNN 
+pred_knn_test <- prediction(knn_test_prob[,1], Cust_test$churn)
+#plot TPR - FPR
+roc_perf_knn_test <- performance(pred_knn_test, measure = "tpr", x.measure = "fpr")
+plot(roc_perf_knn_test,colorize=TRUE,print.cutoffs.at=seq(0.1,by=0.1))
+```
+```{r}
+#Calculate ROC value for binary classifier
+roc.curve(Cust_test$churn, knn_test_prob[,1], plotit= F)
+```
+
+```{r}
+confusionMatrix(as.factor(ifelse(knn_test_prob[,1]>0.94, "yes", "no")), Cust_test$churn, positive = "yes")
+```
+<br>  
+**KNN Metric**<br>  
+True Positive (TP) = 32 <br>  
+True Negative (TN) = 585 <br>  
+False Positive (FP) = 270 <br>  
+False Negative (FN) = 112 <br>  
+Miscalculations = 382 <br>  
+Accuracy = 61.76% <br>  
+Specificity = 68.42% <br>  
+Sensitivity = 22.22% <br>  
+
+```{r}
+#Naive Bayes 
+pred_nb_test <- prediction(nb_test_prob[,1], Cust_test$churn)
+roc_perf_nb_test <- performance(pred_nb_test, measure = "tpr", x.measure = "fpr")
+plot(roc_perf_nb_test,colorize=TRUE,print.cutoffs.at=seq(0.1,by=0.1))
+```
+<br>  
+```{r}
+#Calculate ROC value for binary classifier
+roc.curve(Cust_test$churn, nb_test_prob[,1], plotit= F)
+```
+
+```{r}
+confusionMatrix(as.factor(ifelse(nb_test_prob[,1]>0.95, "yes", "no")), Cust_test$churn, positive = "yes")
+```
+<br>  
+
+**Naive Bayes Metric**<br>  
+True Positive (TP) = 14 <br>  
+True Negative (TN) = 471 <br>  
+False Positive (FP) = 384 <br>  
+False Negative (FN) = 130 <br>  
+Miscalculations = 514 <br>  
+Accuracy = 48.55% <br>  
+Specificity = 55.09% <br>  
+Sensitivity = 9.72% <br>  
+
+```{r}
+#decision tree (dt): create prediction object for ROCR evaluation 
+pred_dt_test <- prediction(dt_test_prob[,1], Cust_test$churn)
+roc_perf_dt_test <- performance(pred_dt_test, measure = "tpr", x.measure = "fpr")
+plot(roc_perf_nb_test,colorize=TRUE,print.cutoffs.at=seq(0.1,by=0.1))
+```
+
+```{r}
+#Calculate ROC value for binary classifier
+roc.curve(Cust_test$churn, dt_test_prob[,1], plotit= F)
+```
+
+```{r}
+confusionMatrix(as.factor(ifelse(dt_test_prob[,1]>0.967, "yes", "no")), Cust_test$churn, positive = "yes")
+```
+<br>  
+**Decision Tree Metric**<br>  
+True Positive (TP) = 0 <br>  
+True Negative (TN) = 836 <br>  
+False Positive (FP) = 19 <br>  
+False Negative (FN) = 144 <br>  
+Miscalculations = 163 <br>  
+Accuracy = 83.68% <br>  
+Specificity = 97.78% <br>  
+Sensitivity = 0.0% <br> 
+<br>  
+
+**Conclusion**<br>  
+Decision Tree and Logistic Regression model have good performance in accuracy, 
+ROC value and specificity. LR model has a better sensitivity but DT has better 
+ROC value which means the model is better. We will choose to apply DT on the 
+test data. <br>  
+<br>  
+
+
+**Test Data Prediction**<br>  
+```{r}
+#updating the binary variables
+Customers_To_Predict$international_plan <- ifelse(Customers_To_Predict$international_plan =="yes", 1, 0)
+Customers_To_Predict$voice_mail_plan <- ifelse(Customers_To_Predict$voice_mail_plan =="yes", 1, 0)
+
+#apply DT model on the test data
+customer_test <- predict(dt_model, Customers_To_Predict, type = "prob")
+x <- cbind(Customers_To_Predict, customer_test)
+
+#set cutoff value
+x$prob <- ifelse(x$'no'>0.967, "no", "yes")
+Customers_To_Predict$churn_prob <- x$prob
+```
+
+```{r}
+write_xlsx(Customers_To_Predict, "Customer_to_Predict.xlsx") #create excel output 
+```
+
+**Conclusion**<br>  
+The test data has been updated with additional variable "churn_prob" which provide
+the probability of churn for each customer. The model aims to reduce false negatives
+and tolerates more on false positives. It will cost more on the company to miss
+a churning customer than to mis-classify un-churning customers. If provided with 
+the promotion cost, cost for false positive and false negative, we can further 
+calculate the total saving cost for the company. 
