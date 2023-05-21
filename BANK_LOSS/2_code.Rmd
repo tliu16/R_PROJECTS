@@ -1,0 +1,399 @@
+---
+title: "64037_group_proj"
+author: "wliu16"
+date: "2023-04-21"
+output: pdf_document
+---
+
+```{r, include = FALSE}
+library(bit64)
+library(caret)
+library(data.table)
+library(dplyr)
+library(e1071)
+library(gbm)
+library(ggplot2)
+library(glmnet)
+library(keras)
+library(kernlab)
+library(pls)
+library(pROC)
+library(reticulate)
+```
+
+```{r}
+#Remove large object
+rm(list=ls()) 
+gc() # Garbage collection
+```
+
+```{r, include = FALSE}
+setwd("/Users/tammyliu/Desktop/64037-001") # Set working directory
+df <- fread("train_v3.csv") # Load the data
+file_to_predict <- fread("test__no_lossv3.csv")
+```
+
+Data Cleaning - Remove NAs and outliers
+```{r, include = FALSE}
+# Change all data to numeric
+df <- df[, 3:763] # Remove V1, id columns
+table(sapply(df, class)) # Variable col spread: 20 chr, 48 int64, 199 int, 494 num
+df <- as.data.frame(sapply(df, as.double)) # Change all to num
+
+# Check NA number
+na_count <-  is.na(df)
+num_of_na_inrow <- rowSums(na_count)
+
+# There are 39430 rows that contains no NA values
+# The default distribution is good in training and testing so removing all NA
+df <- df[which(as.vector(num_of_na_inrow)==0),]
+
+# Add new default column in factor: Customer is default when loss != 0 
+dummy <- df %>% select (loss) %>% 
+  mutate(default = ifelse(loss==0, FALSE, TRUE)) 
+df$default <- dummy[, 2]
+df$default  <- as.factor(df$default) # df has both loss and default
+
+# Store loss and remove loss from df
+#loss <- dummy[, 1]
+#df <- df[, -(ncol(df)-1)] # Remove loss column from df
+
+# Detect and remove all rows containing outliers
+x <- df[, -ncol(df)]
+max_vals <- apply(x, 1, max) # Calculate max value in each row
+med_max <- median(max_vals) # Calculate median value in max_val
+df <- df[max_vals <= 3 * med_max, ] # Outlier value as 2 times of median
+# Check default distribution in df and make sure its about 10%
+# 25652 rows left, ~15000 rows containing outliers removed
+```
+
+
+Data Cleaning- preprocess and remove near zero variance
+```{r}
+# Normalization, remove "near zero variance" (loss is removed as nzv)
+data_processing_1 <- preProcess(df, method = c("center", "scale", "nzv"))
+df_scaled_b4rank <- predict(data_processing_1, df) # 22 removed for near zero variance
+
+# loss is not removed as zv
+data_processing_2 <- preProcess(df, method = c("center", "scale", "zv"))
+df_scaled_b4rank_loss <- predict(data_processing_2, df)
+```
+
+
+Remove IVs highly correlated with each other and low correlated to target  
+```{r, include = FALSE} 
+# Reorder columns so that they are ranked by number of unique values from highest to lowest. 
+rm(num_of_unique)
+num_of_unique <- c()
+
+for (x in 1:(length(df_scaled_b4rank)-1)) {
+  num_of_unique = append(num_of_unique,length(unique(df_scaled_b4rank[, x])))
+}
+rkk <- rank(-num_of_unique, ties.method= "first")
+rkk<- append(rkk, length(df_scaled_b4rank))
+
+rm(reorder_index)
+reorder_index <- c()
+for (x in 1:(length(df_scaled_b4rank))) {
+  reorder_index = append(reorder_index,which(rkk == x))
+}
+df1_scaled <- df_scaled_b4rank[, reorder_index]
+
+
+# In each highly correlated pair, remove the second element
+cor_matrix <- cor(df1_scaled[, -ncol(df1_scaled)]) # IV correlation matrix
+cor_upper <- cor_matrix * upper.tri(cor_matrix, diag = FALSE) # Matrix of 0 and correlation
+
+index <- apply(cor_upper, 1, function(x) paste(colnames(cor_upper)[which(abs(x) > 0.9)], collapse = ", "))
+# Store IV names if correlation absolute value is larger than certain threshold
+elements <- unique(unlist(strsplit(index, split = ", "))) 
+# Split names in one string to chr vector and remove duplicated IV names
+#elements 
+
+cols_to_keep <- setdiff(names(df1_scaled), elements)
+df2_rmiv <- df1_scaled[, cols_to_keep] # 224 IVs remained at 0.9 threshold
+
+
+# Remove variables that has low correlation with default
+y <- as.double(df2_rmiv[, ncol(df2_rmiv)])
+default <- as.factor(y)
+cor_index <- as.vector(cor(df2_rmiv[, -ncol(df2_rmiv)], y)) # Calculate correlation
+
+plot(density(cor_index)) # The density plot shows all variables have weak correlation
+# with target variable default and most are only 3-4% correlated
+
+threshold <- 0.04 # Set correlation threshold and remove variables with <4% correlation
+selected_indices <- which(abs(cor_index) > threshold) 
+selected_variables <- names(df2_rmiv)[selected_indices] 
+
+df2_rmdv <- cbind(df2_rmiv[, c(selected_variables)], default) 
+```
+
+
+
+```{r, include = FALSE}
+# Create data partitions
+# Use a portion of the data
+df3 <- df2_rmdv
+summary(df3$default) # Make sure there is default data in training and testing
+
+set.seed(123)
+trainingIndex_0 <- createDataPartition(df3$default, p=0.8, list = FALSE)
+training_0 <- df3[trainingIndex_0, ]
+testing_0 <- df3[- trainingIndex_0,]
+```
+
+
+
+
+```{r}
+# NNet
+
+set.seed(123)
+
+df_train <- training_0
+df_test <- testing_0
+
+# Prepare the data for the neural network model
+X_train_nn <- as.matrix(df_train[, -ncol(df_train)])
+y_train_nn <- as.numeric(df_train[, "default"]) - 1
+X_test_nn <- as.matrix(df_test[, -ncol(df_test)])
+y_test_nn <- as.numeric(df_test[, "default"]) - 1
+
+# Build the neural network model
+model_nn <- keras_model_sequential() %>%
+  layer_dense(units = 60, activation = "relu", input_shape = ncol(X_train_nn)) %>%
+  layer_dense(units = 60, activation = "relu") %>%
+  layer_dense(units = 30, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+# Compile the model
+model_nn %>% compile(
+  optimizer = "adam",
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+# Train the model
+history <- model_nn %>% fit(
+  X_train_nn, y_train_nn,
+  epochs = 50,
+  batch_size = 100,
+  validation_split = 0.2
+)
+plot(history)
+
+# Generate predictions on the test set
+predictions_nn <- predict(model_nn, X_test_nn)
+predicted_labels_nn <- ifelse(predictions_nn > 0.5, 1, 0) # Convert the predictions to class labels
+confusion_mat_nn <- confusionMatrix(as.factor(predicted_labels_nn), as.factor(y_test_nn))
+confusion_mat_nn
+```
+
+
+
+
+
+
+
+
+
+Classification Model Prediction
+```{r, include = FALSE}
+# Process the df_test data in the same way as the training data
+file_to_predict <- file_to_predict[, 3:ncol(file_to_predict)] # Remove V1, id columns
+file_to_predict <- as.data.frame(sapply(file_to_predict, as.double)) # Change all to num
+
+# Data Cleaning - Replace missing values with median
+file_to_predict <- file_to_predict %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = T), x))
+sum(is.na(file_to_predict))== 0 # TRUE if all NA has been replaced
+
+# Normalization, remove "near zero variance"
+data_processing_test <- preProcess(file_to_predict, method = c("center", "scale", "nzv"))
+df_scaled_b4rank_test <- predict(data_processing_test, file_to_predict) # 22 removed for near zero variance
+
+df2_rmdv_test <- df_scaled_b4rank_test %>% select(, names(df2_rmdv[, -ncol(df2_rmdv)]))
+
+```
+
+
+```{r}
+# Apply model on the testing data
+
+# Prepare the data for the neural network model
+X_nn_test <- as.matrix(df2_rmdv_test)
+predicted_probs_nn <- predict(model_nn, X_nn_test)
+
+# Convert the predicted probabilities to binary class labels
+predicted_labels_nn <- ifelse(predicted_probs_nn > 0.5, 1, 0)
+
+# Convert the predicted_labels_nn to a factor
+default_predicted <- factor(predicted_labels_nn)
+levels(default_predicted) <- levels(testing_0$default) # levels 1 2
+df2_rmdv_test <- cbind(df2_rmdv_test, default_predicted) # Add the predicted default column
+
+# df2_rmdv_test testing dataset
+```
+
+
+```{r, include = FALSE}
+# Add loss column and calculate the loss == 0 when customer is not default
+df2_rmdv_test$loss_predicted <- ifelse(df2_rmdv_test$default == 1, 0, 
+                                       ifelse(df2_rmdv_test$default == 2, NA, predicted_probs_nn))
+df2_rmdv_test$loss_predicted <- as.numeric(df2_rmdv_test$loss_predicted)
+
+# Change column names to loss
+#colnames(df_scaled_b4rank_loss)[ncol(df_scaled_b4rank_loss)] <- "default"
+
+```
+
+
+```{r, include = FALSE}
+# Choose one training data for loss model and comment out the other
+rm(run_data)
+
+# Data 1: Use all data to train, 23692 obs X 743 variables
+#run_data <- df_scaled_b4rank_loss 
+
+# Data 2: Use only default data to train, 2436 obs X 743 variables
+run_data <- df_scaled_b4rank_loss[df_scaled_b4rank_loss$default == TRUE, ]
+run_data <- run_data[, -ncol(run_data)] # Delete the default column as it is true for all
+```
+
+Bi-variate analysis: remove variables based on target variable loss 
+```{r} 
+# Reorder columns so that they are ranked by number of unique values from highest to lowest. 
+rm(num_of_unique)
+num_of_unique <- c()
+
+for (x in 1:(length(run_data)-1)) {
+  num_of_unique = append(num_of_unique,length(unique(run_data[, x])))
+}
+rkk <- rank(-num_of_unique, ties.method= "first")
+rkk<- append(rkk, length(run_data))
+
+rm(reorder_index)
+reorder_index <- c()
+for (x in 1:(length(run_data))) {
+  reorder_index = append(reorder_index,which(rkk == x))
+}
+run_data <- run_data[, reorder_index]
+
+# In each highly correlated pair, remove the second element
+cor_matrix2 <- cor(run_data[, -c(ncol(run_data), ncol(run_data)-1)]) # IV correlation matrix
+cor_upper2 <- cor_matrix2 * upper.tri(cor_matrix2, diag = FALSE) # Matrix of 0 and correlation
+
+index2 <- apply(cor_upper2, 1, function(x) paste(colnames(cor_upper2)[which(abs(x) > 0.9)], collapse = ", "))
+# Store IV names if correlation absolute value is larger than certain threshold
+elements2 <- unique(unlist(strsplit(index2, split = ", "))) 
+# Split names in one string to chr vector and remove duplicated IV names
+#elements2 
+
+cols_to_keep2 <- setdiff(names(run_data), elements2)
+run_data <- run_data[, cols_to_keep2] #  232 IVs remained at 0.9 threshold
+
+
+# Remove variables that has low correlation with default
+cor_index2 <- as.vector(cor(run_data[, -ncol(run_data)], run_data[, ncol(run_data)])) # Calculate correlation
+plot(density(cor_index2))
+
+threshold2 <- 0.2 # Set correlation threshold
+selected_indices2 <- which(abs(cor_index2) > threshold2) 
+selected_variables2 <- names(run_data)[selected_indices2] # 20 variables remained
+
+run_data <- cbind(run_data[, c(selected_variables2)], run_data[, ncol(run_data)]) 
+colnames(run_data)[ncol(run_data)] <- "loss_predicted"
+summary(run_data$loss_predicted)
+```
+
+
+
+```{r, include = FALSE}
+# Create data partitions
+# Use first 1000 of the data
+df4 <- run_data
+summary(df4$loss_predicted) 
+
+set.seed(246)
+trainingIndex_1 <- createDataPartition(df4$loss_predicted, p=0.8, list = FALSE)
+training_1 <- df4[trainingIndex_1, ]
+testing_1 <- df4[- trainingIndex_1,]
+
+```
+
+```{r}
+#NNet
+
+set.seed(246)
+
+train_control <- trainControl(method = "repeatedcv", 
+                              number = 10, 
+                              repeats = 3)
+
+# Define the model architecture
+model_nn_loss <- keras_model_sequential() %>%
+  layer_dense(units = 150, activation = "relu", input_shape = ncol(training_1) - 1) %>%
+  #layer_dense(units = 60, activation = "relu") %>%
+  #layer_dense(units = 30, activation = "relu") %>%
+  layer_dense(units = 1, activation = "linear")
+
+# Compile the model
+model_nn_loss %>% compile(
+  loss = "mse",
+  optimizer = optimizer_adam(),
+  metrics = c("mae", "mse")
+)
+
+# Train the model
+history_nn_loss <- model_nn_loss %>% fit(
+  x = as.matrix(training_1[, 1:20]),
+  y = as.matrix(training_1[, "loss_predicted"]),
+  validation_split = 0.2,
+  epochs = 50,
+  batch_size = 32,
+  trControl = train_control
+)
+
+# Evaluate the model
+model_nn_loss %>% evaluate(
+  x = as.matrix(testing_1[, 1:20]),
+  y = as.matrix(testing_1[, "loss_predicted"])
+)
+
+plot(history_nn_loss)
+
+# predict on testing data using the trained model
+predicted_loss <- predict(model_nn_loss, as.matrix(testing_1[, 1:20]))
+
+# calculate performance metrics
+MAE <- mean(abs(as.matrix(testing_1[, "loss_predicted"]) - predicted_loss))
+MSE <- mean((as.matrix(testing_1[, "loss_predicted"]) - predicted_loss)^2)
+RMSE <- sqrt(MSE)
+R_squared <- cor(as.matrix(testing_1[, "loss_predicted"]), predicted_loss)^2
+
+MAE
+MSE
+RMSE
+R_squared
+```
+
+```
+Run the loss prediction 
+```{r}
+# Extract the input variables from the testing data
+X_test_loss <- as.matrix(df2_rmdv_test[, 1:20])
+
+# Use the trained model to predict the loss for the NA values in the testing data
+y_pred_loss <- predict(model_nn_loss, X_test_loss)
+
+# Replace the NA values in the loss_predicted column with the predicted values
+df2_rmdv_test$loss_predicted[is.na(df2_rmdv_test$loss_predicted)] <- y_pred_loss
+
+# output the "column_name" column to a csv file
+write.csv(df2_rmdv_test$loss_predicted, file = "Results.csv", row.names = FALSE)
+
+```
+
+
+
