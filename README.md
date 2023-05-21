@@ -1,1 +1,1 @@
-CHURN PREDICTION FOR TELECOM COMPANIES
+various R data mining projects
